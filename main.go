@@ -5,9 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-
 	"log"
 	"net/http"
 	"os"
@@ -16,7 +14,6 @@ import (
 
 	"github.com/dgrijalva/jwt-go"
 	"github.com/g8rswimmer/go-sfdc"
-	"github.com/g8rswimmer/go-sfdc/bulk"
 	"github.com/g8rswimmer/go-sfdc/credentials"
 	"github.com/g8rswimmer/go-sfdc/session"
 	"github.com/g8rswimmer/go-sfdc/sobject"
@@ -27,219 +24,166 @@ import (
 	"github.com/rusq/slackdump/v2/auth"
 )
 
-type dml struct {
-	sobject string
-	fields  map[string]interface{}
-	id      string
+type DML struct {
+	SObject string                 `json:"sobject"`
+	Fields  map[string]interface{} `json:"fields"`
+	ID      string                 `json:"id,omitempty"`
 }
 
 type SlackRequestBody struct {
 	Text string `json:"text"`
 }
 
+const (
+	timeFormat = "2006-01-02 15:04:05"
+)
+
 var (
-	from = time.Date(time.Now().Year(), time.September, 1, 00, 00, 00, 00, time.Local)
+	from = time.Date(time.Now().Year(), time.September, 1, 0, 0, 0, 0, time.Local)
 	to   = time.Now()
 )
 
 func init() {
-	err := godotenv.Load(".env")
-	if err != nil {
-		log.Fatal("Error loading .env file")
+	if err := godotenv.Load(".env"); err != nil {
+		log.Fatal("Error loading .env file:", err)
 	}
 }
 
 func main() {
-
-	//password 认证
-	//session, err := password()
-
-	//JWT 认证
 	session, err := jsonWebToken()
 	if err != nil {
-		fmt.Printf("Authentication failed %s\n", err.Error())
-		return
+		log.Fatalf("Authentication failed: %v", err)
 	}
 
-	// 创建payload数据并同步到Salesforce
-	generatePayloads(session)
+	if err := generatePayloads(session); err != nil {
+		log.Fatalf("Failed to generate payloads: %v", err)
+	}
 }
 
-// 构建MQ Payload数据
-func generatePayloads(session *session.Session) {
-	//存待创建的payload list数据
-
+func generatePayloads(session *session.Session) error {
 	provider, err := auth.NewValueAuth(os.Getenv("SLACK_TOKEN"), os.Getenv("SLACK_COOKIE"))
 	if err != nil {
-		log.Print(err)
-		return
-	}
-	sd, err := slackd.New(context.Background(), provider)
-	if err != nil {
-		log.Print(err)
-		return
+		return fmt.Errorf("failed to create Slack auth provider: %w", err)
 	}
 
-	//根据频道ID获取Chat History
+	sd, err := slackd.New(context.Background(), provider)
+	if err != nil {
+		return fmt.Errorf("failed to create Slack dumper: %w", err)
+	}
+
 	results, err := sd.Dump(context.Background(), os.Getenv("SLACK_CHANNELID"), from, to)
 	if err != nil {
-		log.Print(err)
-		return
+		return fmt.Errorf("failed to dump Slack messages: %w", err)
 	}
 
 	mqQueue, err := queryMQQueue("MQWebhookV1RestService", session)
-	if err != nil || mqQueue == nil {
-		log.Print(err)
-		return
+	if err != nil {
+		return fmt.Errorf("failed to query MQ queue: %w", err)
 	}
 
-	success := 0
-	failed := 0
+	resource, err := collections.NewResources(session)
+	if err != nil {
+		return fmt.Errorf("failed to create Salesforce resource: %w", err)
+	}
 
-	// 循环chat history并解析event detail
+	var success, failed int
+	var insertRecords []sobject.Inserter
+
 	for _, s := range results.Messages {
-		str := s.Message.Text
-		splitArr := strings.Split(str, "event_detail:")
-		if len(splitArr) >= 2 {
+		payload, err := createPayload(s.Message.Text, mqQueue)
+		if err != nil {
+			continue
+		}
+		insertRecords = append(insertRecords, payload)
+	}
 
-			var insertRecords []sobject.Inserter
+	saveResults, err := resource.Insert(true, insertRecords)
+	if err != nil {
+		return fmt.Errorf("failed to insert records: %w", err)
+	}
 
-			//解析topic name
-			strJson := strings.ReplaceAll(splitArr[1], "'", "\"")
-			formattedStrJson := strings.ReplaceAll(strJson, "False", "false")
-
-			//构建Payload data structure
-			payload := &dml{
-				sobject: "MQ_Payload__c",
-				fields: map[string]interface{}{
-					"MQ_Queue__c": mqQueue["Id"].(string),
-					"Name":        mqQueue["Name"].(string) + " - Slack - " + time.Now().Format("2006-01-02 03:04:05"),
-					"Status__c":   "Queued",
-					//"Status__c":   "Aborted",
-					"Request__c": formattedStrJson,
-				},
-			}
-			insertRecords = append(insertRecords, payload)
-
-			resource, _ := collections.NewResources(session)
-			saveResults, _ := resource.Insert(true, insertRecords)
-
-			for _, saveResult := range saveResults {
-				if saveResult.Success {
-					success++
-				} else {
-					failed++
-					webhookUrl := os.Getenv("SLACK_WEBHOOK")
-					syncResult := formattedStrJson
-					SendSlackNotification(webhookUrl, syncResult)
-				}
+	for _, saveResult := range saveResults {
+		if saveResult.Success {
+			success++
+		} else {
+			failed++
+			if err := sendSlackNotification(os.Getenv("SLACK_WEBHOOK"), saveResult.Errors[0].Message); err != nil {
+				log.Printf("Failed to send Slack notification: %v", err)
 			}
 		}
 	}
 
-	log.Println("Inserted successfully ", success, " records.")
-	log.Println("Insert failed ", failed, " records.")
+	log.Printf("Inserted successfully %d records. Insert failed %d records.", success, failed)
+	return nil
 }
 
-// 基于过滤条件获取MQ记录
-func queryMQQueue(filter string, session *session.Session) (map[string]interface{}, error) {
+func createPayload(text string, mqQueue map[string]interface{}) (*DML, error) {
+	splitArr := strings.Split(text, "event_detail:")
+	if len(splitArr) < 2 {
+		return nil, fmt.Errorf("invalid message format")
+	}
 
+	strJson := strings.ReplaceAll(splitArr[1], "'", "\"")
+	formattedStrJson := strings.ReplaceAll(strJson, "False", "false")
+
+	return &DML{
+		SObject: "MQ_Payload__c",
+		Fields: map[string]interface{}{
+			"MQ_Queue__c": mqQueue["Id"].(string),
+			"Name":        fmt.Sprintf("%s - Slack - %s", mqQueue["Name"].(string), time.Now().Format(timeFormat)),
+			"Status__c":   "Queued",
+			"Request__c":  formattedStrJson,
+		},
+	}, nil
+}
+
+func queryMQQueue(filter string, session *session.Session) (map[string]interface{}, error) {
 	where, err := soql.WhereEquals("Name", filter)
 	if err != nil {
-		fmt.Printf("SOQL Query Where Statement Error %s\n", err.Error())
-		return nil, err
-	}
-	input := soql.QueryInput{
-		ObjectType: "MQ_Queue__c",
-		FieldList: []string{
-			"Id",
-			"Name",
-		},
-		Where: where,
-	}
-	queryStmt, err := soql.NewQuery(input)
-	if err != nil {
-		fmt.Printf("SOQL Query Statement Error %s\n", err.Error())
-		return nil, err
+		return nil, fmt.Errorf("SOQL Query Where Statement Error: %w", err)
 	}
 
-	resource, _ := soql.NewResource(session)
+	input := soql.QueryInput{
+		ObjectType: "MQ_Queue__c",
+		FieldList:  []string{"Id", "Name"},
+		Where:      where,
+	}
+
+	queryStmt, err := soql.NewQuery(input)
+	if err != nil {
+		return nil, fmt.Errorf("SOQL Query Statement Error: %w", err)
+	}
+
+	resource, err := soql.NewResource(session)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create SOQL resource: %w", err)
+	}
+
 	result, err := resource.Query(queryStmt, false)
 	if err != nil {
-		fmt.Printf("SOQL Query Error %s\n", err.Error())
-		return nil, err
+		return nil, fmt.Errorf("SOQL Query Error: %w", err)
 	}
+
 	if result.TotalSize() > 0 {
 		return result.Records()[0].Record().Fields(), nil
 	}
 	return nil, nil
 }
 
-func bulkOperation(session *session.Session) {
-	bulk.NewResource(session)
-}
-
-// 密码方法认证
-func password() (*session.Session, error) {
-
-	pwdCreds, authErr := credentials.NewPasswordCredentials(credentials.PasswordCredentials{
-		URL:          os.Getenv("SALESFORCE_URL"),
-		Username:     os.Getenv("USERNAME"),
-		Password:     os.Getenv("PASSWORD"),
-		ClientID:     os.Getenv("CLIENTID"),
-		ClientSecret: os.Getenv("CLIENTSECRET"),
-	})
-
-	if authErr != nil {
-		fmt.Printf("error %v\n", authErr)
-		return nil, authErr
-	}
-
-	config := sfdc.Configuration{
-		Credentials: pwdCreds,
-		Client:      http.DefaultClient,
-		Version:     50,
-	}
-
-	session, sessionErr := session.Open(config)
-	if sessionErr != nil {
-		fmt.Printf("error %v\n", sessionErr)
-		return nil, sessionErr
-	}
-
-	return session, nil
-}
-
-// JWT方式认证
 func jsonWebToken() (*session.Session, error) {
-	// 读取server key文件
-	privateKeyFile, err := os.Open(os.Getenv("JWT_PATH"))
+	privateKey, err := loadPrivateKey(os.Getenv("JWT_PATH"))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to load private key: %w", err)
 	}
-	pemfileinfo, _ := privateKeyFile.Stat()
-	var size = pemfileinfo.Size()
-	pembytes := make([]byte, size)
-	buffer := bufio.NewReader(privateKeyFile)
-	_, err = buffer.Read(pembytes)
-	pemData := pembytes
-	err = privateKeyFile.Close()
-	if err != nil {
-		return nil, err
-	} // 文件关闭
-	signKey, err := jwt.ParseRSAPrivateKeyFromPEM(pemData)
 
-	// 构建 credentials
-	jwtCred, authErr := credentials.NewJWTCredentials(credentials.JwtCredentials{
+	jwtCred, err := credentials.NewJWTCredentials(credentials.JwtCredentials{
 		URL:            os.Getenv("SALESFORCE_URL"),
 		ClientId:       os.Getenv("JWT_CLIENTID"),
 		ClientUsername: os.Getenv("JWT_USER"),
-		ClientKey:      signKey,
+		ClientKey:      privateKey,
 	})
-
-	if authErr != nil {
-		fmt.Printf("error %v\n", authErr)
-		return nil, authErr
+	if err != nil {
+		return nil, fmt.Errorf("failed to create JWT credentials: %w", err)
 	}
 
 	config := sfdc.Configuration{
@@ -248,62 +192,35 @@ func jsonWebToken() (*session.Session, error) {
 		Version:     50,
 	}
 
-	session, sessionErr := session.Open(config)
-	if sessionErr != nil {
-		fmt.Printf("error %v\n", sessionErr)
-		return nil, sessionErr
-	}
-
-	return session, nil
+	return session.Open(config)
 }
 
-// 发送Slack通知
-func SendSlackNotification(webhookUrl string, msg string) error {
-
-	slackBody, _ := json.Marshal(SlackRequestBody{Text: msg})
-	req, err := http.NewRequest(http.MethodPost, webhookUrl, bytes.NewBuffer(slackBody))
+func loadPrivateKey(path string) (*rsa.PrivateKey, error) {
+	pemData, err := os.ReadFile(path)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	return jwt.ParseRSAPrivateKeyFromPEM(pemData)
+}
+
+func sendSlackNotification(webhookUrl, msg string) error {
+	slackBody, err := json.Marshal(SlackRequestBody{Text: msg})
+	if err != nil {
+		return fmt.Errorf("failed to marshal Slack request body: %w", err)
 	}
 
-	req.Header.Add("Content-Type", "application/json")
-
-	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := http.Post(webhookUrl, "application/json", bytes.NewBuffer(slackBody))
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to send Slack notification: %w", err)
 	}
+	defer resp.Body.Close()
 
-	buf := new(bytes.Buffer)
-	buf.ReadFrom(resp.Body)
-	if buf.String() != "ok" {
-		return errors.New("Non-ok response returned from Slack")
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("non-ok response returned from Slack: %s", resp.Status)
 	}
 	return nil
 }
 
-func (d *dml) SObject() string {
-	return d.sobject
-}
-func (d *dml) Fields() map[string]interface{} {
-	return d.fields
-}
-func (d *dml) ID() string {
-	return d.id
-}
-
-type query struct {
-	sobject string
-	id      string
-	fields  []string
-}
-
-func (q *query) SObject() string {
-	return q.sobject
-}
-func (q *query) ID() string {
-	return q.id
-}
-func (q *query) Fields() []string {
-	return q.fields
-}
+func (d *DML) SObject() string { return d.SObject }
+func (d *DML) Fields() map[string]interface{} { return d.Fields }
+func (d *DML) ID() string { return d.ID }
